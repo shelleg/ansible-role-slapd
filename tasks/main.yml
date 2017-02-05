@@ -1,0 +1,99 @@
+---
+# tasks file for ansible-role-slapd
+
+- debug: var=openldap_domain_name
+- debug: var=openldap_domain_prefix
+- debug: var=openldap_domain_suffix
+
+- name: "install reqs"
+  apt:
+    name: "{{ item }}"
+    state: installed
+  with_items:
+    - openssl
+    - python-selinux
+    - slapd
+    - ldap-utils
+
+- block:
+  - name: "Clean {{ openldap_basedir }}"
+    file:
+      path: "{{ openldap_basedir }}/slapd.d"
+      state: absent
+
+  - name: "Create {{ openldap_basedir }}"
+    file:
+      path: "{{ openldap_basedir }}/slapd.d"
+      state: directory
+      owner: "{{ openldap_user }}"
+      group: "{{ openldap_group }}"
+
+  - name: "set openldap_rootpw [ should have ansible vault value in var name ]"
+    shell: slappasswd -s {{ openldap_rootpw }}
+    register: rootpw
+
+  - debug: var=rootpw
+
+  - name: "set rootpw fact for config"
+    set_fact:
+      openldap_root_password: "{{ rootpw.stdout }}"
+    when: rootpw
+
+  - name: "generate slapd.conf conf file"
+    template:
+      src: "{{ item }}.j2"
+      dest: "{{ openldap_basedir }}/{{ item }}"
+    with_items:
+      - slapd.conf
+      - ldap.conf
+
+  when: openldap_reconfigure != false
+
+- block:
+  - name: Create the directories for certs and ldap database
+    file:
+      path: "{{ item }}"
+      state: directory
+      owner: "{{ openldap_user }}"
+      group: "{{ openldap_group }}"
+    with_items:
+      - "{{ openldap_db_dir }}"
+      - "{{ openldap_certs_dir }}"
+
+  - name: "generate private key for cert request"
+    shell: "openssl genrsa -out {{ openldap_ssl_keyfile }} 1024"
+    args:
+      chdir: "{{ openldap_basedir }}/certs/"
+      creates: "{{ openldap_basedir }}/certs/{{ openldap_ssl_keyfile }}"
+
+  - name: "create and sign the the new certificate"
+    shell: "openssl req -new -x509 -subj '/C={{ openldap_country }}/ST={{ openldap_state }}/L={{ openldap_location }}/O={{ openldap_org }}/CN={{ ansible_hostname }}/' -days 3650 -key {{ openldap_ssl_keyfile }} -out {{ openldap_ssl_certfile }} -extensions v3_ca"
+    args:
+      chdir: "{{ openldap_basedir }}/certs/"
+      creates: "{{ openldap_basedir }}/certs/{{ openldap_ssl_certfile }}"
+
+  - name: "copy slapd file"
+    copy:
+      src: slapd
+      dest: /etc/default/slapd
+      owner: "{{ openldap_user }}"
+      group: "{{ openldap_group }}"
+      mode: 0755
+
+  - name: start the slapd service
+    service:
+      name: slapd
+      state: started
+      enabled: yes
+
+  - name: Copy the template for creating base dn
+    template:
+      src: "{{ openldap_server_ldif }}"
+      dest: /tmp/
+    register: ldifilestat
+
+  - name: add the base domain
+    shell: ldapadd -x -D "cn=Manager,dc={{ openldap_domain_prefix }},dc={{ openldap_domain_suffix }}" -w {{ openldap_rootpw }} -f {{ ldifilestat.dest|default(ldifilestat.path) }} && touch {{ openldap_basedir }}/rootdn_created
+      creates={{ slappd_basedir }}/rootdn_created
+
+  when: openldap_with_ssl
